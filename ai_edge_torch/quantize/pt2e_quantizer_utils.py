@@ -476,21 +476,23 @@ def _do_annotate_conv_bn(
   """
 
   def get_pattern(conv_fn: Callable, relu_is_inplace: bool):
-    def _conv_bn(x, conv_weight, conv_bias, bn_weight, bn_bias, bn_rm, bn_rv):
-      conv = conv_fn(x, conv_weight, conv_bias)
-      bn = F.batch_norm(conv, bn_rm, bn_rv, bn_weight, bn_bias, training=True)
-      if has_relu:
-        output = F.relu_(bn) if relu_is_inplace else F.relu(bn)
-      else:
-        output = bn
-      return output, {
-          "input": x,
-          "conv": conv,
-          "weight": conv_weight,
-          "bias": conv_bias,
-          "output": output,
-      }
+    class ConvBn(torch.nn.Module):
+      def forward(self, x, conv_weight, conv_bias, bn_weight, bn_bias, bn_rm, bn_rv):
+        conv = conv_fn(x, conv_weight, conv_bias)
+        bn = F.batch_norm(conv, bn_rm, bn_rv, bn_weight, bn_bias, training=True)
+        if has_relu:
+          output = F.relu_(bn) if relu_is_inplace else F.relu(bn)
+        else:
+          output = bn
+        return output, {
+            "input": x,
+            "conv": conv,
+            "weight": conv_weight,
+            "bias": conv_bias,
+            "output": output,
+        }
 
+    _conv_bn = ConvBn()
     return _conv_bn
 
   # Needed for matching, otherwise the matches gets filtered out due to unused
