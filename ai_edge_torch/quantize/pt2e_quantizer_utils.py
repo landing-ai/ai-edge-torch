@@ -204,6 +204,49 @@ def get_fixed_qparams_qspec(quantization_config: Optional[QuantizationConfig]):
   return quantization_spec
 
 
+@register_annotator("softmax")                                                                                                                                                                                                 
+def _annotate_softmax(                                                                                                                                                                                                         
+    gm: torch.fx.GraphModule,                                                                                                                                                                                                  
+    quantization_config: Optional[QuantizationConfig],                                                                                                                                                                         
+    filter_fn: Optional[Callable[[Node], bool]] = None,                                                                                                                                                                        
+) -> Optional[List[List[Node]]]:                                                                                                                                                                                               
+    # Get partitions in the graph corresponding to softmax operations                                                                                                                                                          
+    softmax_partitions = get_source_partitions(                                                                                                                                                                                
+        gm.graph,                                                                                                                                                                                                              
+        [torch.nn.functional.softmax],                                                                                                                                                                                         
+        filter_fn,                                                                                                                                                                                                             
+    )                                                                                                                                                                                                                          
+    softmax_partitions = list(itertools.chain(*softmax_partitions.values()))                                                                                                                                                   
+    annotated_partitions = []                                                                                                                                                                                                  
+                                                                                                                                                                                                                               
+    for softmax_partition in softmax_partitions:                                                                                                                                                                               
+        annotated_partitions.append(softmax_partition.nodes)                                                                                                                                                                   
+        softmax_node = softmax_partition.output_nodes[0]                                                                                                                                                                       
+                                                                                                                                                                                                                               
+        # Skip if already annotated                                                                                                                                                                                            
+        if _is_annotated([softmax_node]):                                                                                                                                                                                      
+            continue                                                                                                                                                                                                           
+                                                                                                                                                                                                                               
+        # Define input and output quantization specs                                                                                                                                                                           
+        input_act_qspec = get_input_act_qspec(quantization_config)                                                                                                                                                             
+        output_act_qspec = get_fixed_qparams_qspec(quantization_config)                                                                                                                                                        
+                                                                                                                                                                                                                               
+        # Map input nodes to the input quantization spec                                                                                                                                                                       
+        input_qspec_map = {}                                                                                   
+        input_act = softmax_node.args[0]               
+        if isinstance(input_act, Node):                
+            input_qspec_map[input_act] = input_act_qspec
+                                                                                                               
+        # Annotate the softmax node                                                                            
+        softmax_node.meta["quantization_annotation"] = QuantizationAnnotation(
+            input_qspec_map=input_qspec_map,                                                                   
+            output_qspec=output_act_qspec,                                                                     
+            _annotated=True,                        
+        )                                              
+                                                                                                               
+    return annotated_partitions
+
+
 @register_annotator("linear")
 def _annotate_linear(
     gm: torch.fx.GraphModule,

@@ -282,6 +282,7 @@ class PT2EQuantizer(Quantizer):
       "mul",
       "cat",
       "fixed_qparams",
+      "softmax",
   ]
 
   DYNAMIC_OPS = [
