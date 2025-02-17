@@ -1,4 +1,4 @@
-# Copyright 2024 The AI Edge Torch Authors.
+# Copyright 2025 The AI Edge Torch Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,27 +13,20 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Example of converting a PaliGemma model to multi-signature tflite model."""
+"""Example of converting a Qwen 2.5 VL model to multi-signature tflite model."""
 
 import os
 import pathlib
 
 from absl import app
 from absl import flags
-from ai_edge_torch.generative.examples.paligemma import paligemma
+from ai_edge_torch.generative.examples.qwen_vl import qwen_vl
 from ai_edge_torch.generative.utilities import converter
 from ai_edge_torch.generative.utilities.model_builder import ExportConfig
-import torch
 
-_VERSION = flags.DEFINE_enum(
-    'version',
-    '2',
-    ['1', '2'],
-    'The version of PaliGemma model to verify.',
-)
 _CHECKPOINT_PATH = flags.DEFINE_string(
     'checkpoint_path',
-    os.path.join(pathlib.Path.home(), 'Downloads/llm_data/paligemma2-3b-224'),
+    os.path.join(pathlib.Path.home(), 'Downloads/llm_data/qwen-vl'),
     'The path to the model checkpoint, or directory holding the checkpoint.',
 )
 _OUTPUT_PATH = flags.DEFINE_string(
@@ -43,7 +36,7 @@ _OUTPUT_PATH = flags.DEFINE_string(
 )
 _OUTPUT_NAME_PREFIX = flags.DEFINE_string(
     'output_name_prefix',
-    'paligemma',
+    'qwen_vl',
     'The prefix of the output tflite model name.',
 )
 _PREFILL_SEQ_LEN = flags.DEFINE_integer(
@@ -56,6 +49,16 @@ _KV_CACHE_MAX_LEN = flags.DEFINE_integer(
     1280,
     'The maximum size of KV cache buffer, including both prefill and decode.',
 )
+_IMAGE_HEIGHT = flags.DEFINE_integer(
+    'image_height',
+    34 * 14,
+    'The height of image.',
+)
+_IMAGE_WIDTH = flags.DEFINE_integer(
+    'image_width',
+    46 * 14,
+    'The width of image.',
+)
 _QUANTIZE = flags.DEFINE_bool(
     'quantize',
     True,
@@ -64,20 +67,20 @@ _QUANTIZE = flags.DEFINE_bool(
 
 
 def main(_):
-  pytorch_model = paligemma.build_model(
+  pytorch_model = qwen_vl.build_model(
       _CHECKPOINT_PATH.value,
-      version=int(_VERSION.value),
       kv_cache_max_len=_KV_CACHE_MAX_LEN.value,
+      image_size=(_IMAGE_HEIGHT.value, _IMAGE_WIDTH.value),
   )
 
-  config = pytorch_model.image_encoder.config.image_embedding
+  grid_thw = pytorch_model.image_encoder.get_grid_thw()
   converter.convert_to_tflite(
       pytorch_model,
       output_path=_OUTPUT_PATH.value,
-      output_name_prefix=f'{_OUTPUT_NAME_PREFIX.value}_{_VERSION.value}',
+      output_name_prefix=_OUTPUT_NAME_PREFIX.value,
       prefill_seq_len=_PREFILL_SEQ_LEN.value,
-      pixel_values_size=torch.Size(
-          [1, config.channels, config.image_size, config.image_size]
+      pixel_values_size=(
+          pytorch_model.image_encoder.get_pixel_values_size(grid_thw)
       ),
       quantize=_QUANTIZE.value,
       config=pytorch_model.config.decoder_config,

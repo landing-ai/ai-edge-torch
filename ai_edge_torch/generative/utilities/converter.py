@@ -145,7 +145,7 @@ def _export_helper(
     prefill_input_pos_list.append(torch.arange(0, seq_len, dtype=torch.int))
 
   prefill_pixel_values = (
-      torch.full((1,) + pixel_values_size, 0, dtype=torch.float32)
+      torch.full(pixel_values_size, 0, dtype=torch.float32)
       if pixel_values_size
       else None
   )
@@ -170,7 +170,7 @@ def _export_helper(
 
   # For export, we create a module that captures any non-exportable,
   # arugments, e.g. the generation config object.
-  mod = ExportableModule(pytorch_model, export_config=export_config)
+  mod = ExportableModule(pytorch_model, export_config=export_config).eval()
 
   converter = converter_utils.Converter()
   for lora in loras:
