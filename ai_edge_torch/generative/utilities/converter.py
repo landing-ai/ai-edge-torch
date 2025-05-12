@@ -15,14 +15,20 @@
 
 """Common utility functions for model conversion."""
 
+import enum
 import os
+import pathlib
 from typing import Optional, Union
+from absl import flags
 from ai_edge_torch._convert import converter as converter_utils
+from ai_edge_torch.generative.layers import kv_cache as kv_utils
 from ai_edge_torch.generative.layers import lora as lora_utils
 import ai_edge_torch.generative.layers.model_config as cfg
 from ai_edge_torch.generative.quantize import quant_recipes
-from ai_edge_torch.generative.utilities.model_builder import ExportConfig
+from ai_edge_torch.generative.utilities import export_config
 import torch
+
+ExportConfig = export_config.ExportConfig
 
 
 class ExportableModule(torch.nn.Module):
@@ -37,13 +43,164 @@ class ExportableModule(torch.nn.Module):
     return self.module(*export_args, **full_kwargs)
 
 
+class QuantizationName(str, enum.Enum):
+  """Strings for all supported quantization recipes.
+
+  none: No quantization.
+  dynamic_int8: Dynamic range quantization with int8 weights.
+  weight_only_int8: Weight only quantization with int8 weights.
+  fp16: Float16 quantization.
+  dynamic_int4_block32: Dynamic range quantization with int4 weights and block
+  size of 32, better model quality but slower inference.
+  dynamic_int4_block128: Dynamic range quantization with int4 weights and block
+  size of 128, faster inference but worse model quality.
+  """
+
+  NONE = 'none'
+  DYNAMIC_INT8 = 'dynamic_int8'
+  WEIGHT_ONLY_INT8 = 'weight_only_int8'
+  FP16 = 'fp16'
+  DYNAMIC_INT4_BLOCK32 = 'dynamic_int4_block32'
+  DYNAMIC_INT4_BLOCK128 = 'dynamic_int4_block128'
+
+
+def define_conversion_flags(
+    model_name: str,
+    default_mask_as_input: bool = False,
+    default_transpose_kv_cache: bool = False,
+):
+  """Defines common flags used for model conversion."""
+
+  flags.DEFINE_string(
+      'checkpoint_path',
+      os.path.join(pathlib.Path.home(), f'Downloads/llm_data/{model_name}'),
+      'The path to the model checkpoint, or directory holding the checkpoint.',
+  )
+  flags.DEFINE_string(
+      'output_path',
+      '/tmp/',
+      'The path to export the tflite model.',
+  )
+  flags.DEFINE_string(
+      'output_name_prefix',
+      f'{model_name}',
+      'The prefix of the output tflite model name.',
+  )
+  flags.DEFINE_multi_integer(
+      'prefill_seq_lens',
+      (8, 64, 128, 256, 512, 1024),
+      'List of the maximum sizes of prefill input tensors.',
+  )
+  flags.DEFINE_integer(
+      'kv_cache_max_len',
+      1280,
+      'The maximum size of KV cache buffer, including both prefill and decode.',
+  )
+  flags.DEFINE_string(
+      'quantize',
+      'dynamic_int8',
+      'How the model should be quantized.',
+  )
+  flags.DEFINE_multi_integer(
+      'lora_ranks',
+      None,
+      'If set, the model will be converted with the provided list of LoRA'
+      ' ranks.',
+  )
+  flags.DEFINE_bool(
+      'mask_as_input',
+      default_mask_as_input,
+      'If true, the mask will be passed in as input. Otherwise, mask will be '
+      'built by the model internally.',
+  )
+  flags.DEFINE_bool(
+      'transpose_kv_cache',
+      default_transpose_kv_cache,
+      'If true, the model will be converted with transposed KV cache.',
+  )
+  return flags
+
+
+def get_quant_recipe_from_flag(
+    quantize: str,
+) -> Optional[quant_recipes.QuantizationRecipe]:
+  """Processes the quantization flag and returns the corresponding recipe.
+
+  Args:
+      quantize: The quantization type.
+
+  Returns:
+      The quantization recipe, or None if no quantization is needed.
+
+  Raises:
+      ValueError: If the quantization type is not supported.
+  """
+  match quantize:
+    case QuantizationName.NONE:
+      return None
+    case QuantizationName.DYNAMIC_INT8:
+      return quant_recipes.full_int8_dynamic_recipe()
+    case QuantizationName.WEIGHT_ONLY_INT8:
+      return quant_recipes.full_int8_weight_only_recipe()
+    case QuantizationName.FP16:
+      return quant_recipes.full_fp16_recipe()
+    case QuantizationName.DYNAMIC_INT4_BLOCK32:
+      return quant_recipes.full_int4_dynamic_block_recipe(32)
+    case QuantizationName.DYNAMIC_INT4_BLOCK128:
+      return quant_recipes.full_int4_dynamic_block_recipe(128)
+    case _:
+      raise ValueError(f'Unsupported quantization flag: {quantize}')
+
+
+def create_quantize_suffix(quantize: str) -> str:
+  """Creates a suffix for the output file name based on the quantization type.
+
+  Args:
+      quantize: The quantization type.
+
+  Returns:
+      A string representing the quantization suffix.
+
+  Raises:
+      ValueError: If the quantization type is not supported.
+  """
+  match quantize:
+    case QuantizationName.NONE:
+      return 'f32'
+    case QuantizationName.DYNAMIC_INT8:
+      return 'q8'
+    case QuantizationName.WEIGHT_ONLY_INT8:
+      return 'q8_wo'
+    case QuantizationName.FP16:
+      return 'fp16'
+    case QuantizationName.DYNAMIC_INT4_BLOCK32:
+      return 'q4_block32'
+    case QuantizationName.DYNAMIC_INT4_BLOCK128:
+      return 'q4_block128'
+    case _:
+      raise ValueError(f'Unsupported quantization flag: {quantize}')
+
+
+def _build_mask(mask_len, kv_cache_max_len, causal_mask_value) -> torch.Tensor:
+  if isinstance(mask_len, list):
+    return [
+        _build_mask(i, kv_cache_max_len, causal_mask_value) for i in mask_len
+    ]
+
+  mask = torch.full(
+      (mask_len, kv_cache_max_len), causal_mask_value, dtype=torch.float32
+  )
+  return torch.triu(mask, diagonal=1).unsqueeze(0).unsqueeze(0)
+
+
 def convert_to_tflite(
     pytorch_model: torch.nn.Module,
     output_path: str,
     output_name_prefix: str,
     prefill_seq_len: Union[int, list[int]],
     pixel_values_size: torch.Size = None,
-    quantize: bool = True,
+    pixel_seq_len: int = 0,
+    quantize: str = 'dynamic_int8',
     config: cfg.ModelConfig = None,
     lora_ranks: Optional[list[int]] = None,
     export_config: ExportConfig = None,
@@ -85,12 +242,18 @@ def convert_to_tflite(
         use. If a list, the model will have multiple prefill signatures.
       pixel_values_size (torch.Size, optional): The size of pixel values to pass
         to the model. If None, the model is not expected to take pixel values.
-      quantize (bool, optional): Whether the model should be quanized. Defaults
-        to True.
+      pixel_seq_len (int, optional): The length of pixel tokens, or pixel
+        embeddings generated by the image encoder with pixel values. The actual
+        length of prefill_seq_len will be added by pixel_seq_len when pixel
+        values are passed.
+      quantize (str, optional): The quantization type. Defaults to
+        'dynamic_int8'.
       config (cfg.ModelConfig, optional): The model config used to configure KV
         cache. If None, it uses the config of the pytorch_model.
       lora_ranks (list[int], optional): The ranks of the LORA layers. If None,
         no LoRA signatures will be added.
+      export_config (ExportConfig, optional): The export configuration. If None,
+        it uses the default export configuration.
   """
   # pylint: disable=protected-access
   torch._dynamo.config.cache_size_limit = 64
@@ -105,11 +268,16 @@ def convert_to_tflite(
       lora = lora_utils.LoRA.zeros(rank, config)
       loras.append(lora)
 
-  quant_suffix = 'q8' if quantize else 'f32'
+  quant_suffix = create_quantize_suffix(quantize)
   kv_size = config.kv_cache_max_len
   lora_suffix = (
       '' if not lora_ranks else f'_lora{",".join(map(str, lora_ranks))}'
   )
+
+  if export_config is not None:
+    if export_config.decode_batch_size > 1:
+      output_name_prefix += f'_dbs{export_config.decode_batch_size}'
+
   output_filename = (
       f'{output_name_prefix}_{quant_suffix}_ekv{kv_size}{lora_suffix}.tflite'
   )
@@ -120,6 +288,7 @@ def convert_to_tflite(
       output_file,
       prefill_seq_lens,
       pixel_values_size,
+      pixel_seq_len,
       quantize,
       config,
       loras,
@@ -132,7 +301,8 @@ def _export_helper(
     output_file: str,
     prefill_seq_lens: list[int],
     pixel_values_size: torch.Size,
-    quantize: bool,
+    pixel_seq_len: int,
+    quantize: str,
     config: cfg.ModelConfig,
     loras: list[None | lora_utils.LoRA],
     export_config: ExportConfig,
@@ -144,29 +314,45 @@ def _export_helper(
     prefill_tokens_list.append(torch.full((1, seq_len), 0, dtype=torch.int))
     prefill_input_pos_list.append(torch.arange(0, seq_len, dtype=torch.int))
 
-  prefill_pixel_values = (
-      torch.full(pixel_values_size, 0, dtype=torch.float32)
-      if pixel_values_size
-      else None
-  )
+  prefill_pixel_values = None
+  prefill_tokens_list_with_pixel = []
+  prefill_input_pos_list_with_pixel = []
+  if pixel_values_size is not None:
+    prefill_pixel_values = torch.full(pixel_values_size, 0, dtype=torch.float32)
+    for seq_len in prefill_seq_lens:
+      prefill_tokens_list_with_pixel.append(
+          torch.full((1, seq_len + pixel_seq_len), 0, dtype=torch.int)
+      )
+      prefill_input_pos_list_with_pixel.append(
+          torch.arange(0, seq_len + pixel_seq_len, dtype=torch.int)
+      )
 
-  if export_config.prefill_mask is None:
-    prefill_masks = None
-  elif isinstance(export_config.prefill_mask, torch.Tensor):
-    prefill_masks = [export_config.prefill_mask]
-  elif isinstance(export_config.prefill_mask, list):
-    prefill_masks = export_config.prefill_mask
-  else:
-    raise ValueError('Prefill masks unrecognized.')
-
-  if prefill_masks:
+  prefill_masks = None
+  if flags.FLAGS.mask_as_input:
+    prefill_masks = _build_mask(
+        flags.FLAGS.prefill_seq_lens,
+        flags.FLAGS.kv_cache_max_len,
+        config.causal_mask_value,
+    )
+    if not isinstance(prefill_masks, list):
+      prefill_masks = [prefill_masks]
     assert len(prefill_masks) == len(prefill_seq_lens)
 
-  decode_token = torch.tensor([[0]], dtype=torch.int)
+  decode_token = torch.tensor(
+      [[0] for _ in range(export_config.decode_batch_size)], dtype=torch.int
+  )
   decode_input_pos = torch.tensor([0], dtype=torch.int)
-  kv = export_config.kvcache_cls.from_model_config(config)
+  prefill_kv = kv_utils.KVCache.from_model_config(
+      config, kv_layout=export_config.kvcache_layout
+  )
+  decode_kv = kv_utils.KVCache.from_model_config(
+      config,
+      batch_size=export_config.decode_batch_size,
+      kv_layout=export_config.kvcache_layout,
+  )
 
-  quant_config = quant_recipes.full_int8_dynamic_recipe() if quantize else None
+  quant_config = get_quant_recipe_from_flag(quantize)
+  quant_config._model_config = config
 
   # For export, we create a module that captures any non-exportable,
   # arugments, e.g. the generation config object.
@@ -176,14 +362,12 @@ def _export_helper(
   for lora in loras:
     for i in range(len(prefill_seq_lens)):
       prefill_seq_len = prefill_seq_lens[i]
-      prefill_tokens = prefill_tokens_list[i]
-      prefill_input_pos = prefill_input_pos_list[i]
       prefill_signature_name = f'prefill_{prefill_seq_len}'
 
       sample_kwargs = {
-          'tokens': prefill_tokens,
-          'input_pos': prefill_input_pos,
-          'kv_cache': kv,
+          'tokens': prefill_tokens_list[i],
+          'input_pos': prefill_input_pos_list[i],
+          'kv_cache': prefill_kv,
       }
       if prefill_masks is not None:
         sample_kwargs['mask'] = prefill_masks[i]
@@ -199,22 +383,31 @@ def _export_helper(
       )
 
       if prefill_pixel_values is not None:
+        sample_kwargs['tokens'] = prefill_tokens_list_with_pixel[i]
+        sample_kwargs['input_pos'] = prefill_input_pos_list_with_pixel[i]
+        sample_kwargs['pixel_values'] = prefill_pixel_values
         converter.add_signature(
             prefill_signature_name + '_pixel',
             mod,
-            sample_kwargs={
-                **sample_kwargs,
-                'pixel_values': prefill_pixel_values,
-            },
+            sample_kwargs=sample_kwargs,
         )
 
     sample_kwargs = {
         'tokens': decode_token,
         'input_pos': decode_input_pos,
-        'kv_cache': kv,
+        'kv_cache': decode_kv,
     }
-    if export_config.decode_mask is not None:
-      sample_kwargs['mask'] = export_config.decode_mask
+    if flags.FLAGS.mask_as_input:
+      # Note that the decode mask is not a correct causal mask, but it is okay
+      # for the conversion purpose because only the shape matters in conversion.
+      # A correct causal mask of decode for a given token position of decode, it
+      # should be built like:
+      #
+      #  torch.triu(mask, diagonal=decode_position).unsqueeze(0).unsqueeze(0)
+      #
+      sample_kwargs['mask'] = _build_mask(
+          1, flags.FLAGS.kv_cache_max_len, config.causal_mask_value
+      )
     if lora is not None:
       sample_kwargs['lora'] = lora
 
@@ -224,5 +417,7 @@ def _export_helper(
         sample_kwargs=sample_kwargs,
     )
 
-  edge_model = converter.convert(quant_config=quant_config)
+  edge_model = converter.convert(
+      quant_config=quant_config,
+  )
   edge_model.export(output_file)

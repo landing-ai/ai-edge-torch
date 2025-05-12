@@ -11,4 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+# ==============================================================================
+"""Torch-TFL ops definitions, decompositions, and lowerings."""
+from ai_edge_torch.odml_torch.experimental.torch_tfl import _decomps
+from ai_edge_torch.odml_torch.experimental.torch_tfl import _lowerings
+from ai_edge_torch.odml_torch.experimental.torch_tfl import _ops
+
+decomps = _decomps.decomps

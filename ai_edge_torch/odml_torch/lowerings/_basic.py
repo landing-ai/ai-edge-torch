@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 import math
+import operator
 from typing import Optional, Union
 
 from ai_edge_torch.odml_torch import export_utils
@@ -23,6 +24,7 @@ from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import hlo as stablehlo
 import numpy as np
 import torch
+
 
 LoweringContext = context.LoweringContext
 lower = registry.lower
@@ -216,6 +218,15 @@ def _aten_floor(lctx, x: ir.Value, *, out=None) -> ir.Value:
 
 
 # Schema:
+#   - aten::abs(Tensor input) -> Tensor
+# Torch Reference:
+#   - https://pytorch.org/docs/main/generated/torch.abs.html
+@lower(torch.ops.aten.abs.default)
+def _aten_abs(lctx, input: ir.Value, *, out=None) -> ir.Value:
+  return stablehlo.abs(input)
+
+
+# Schema:
 #   - aten::cat(Tensor[] tensors, int dim=0) -> Tensor
 # Torch Reference:
 #   - https://pytorch.org/docs/main/generated/torch.cat.html
@@ -292,3 +303,41 @@ def _aten_slice_scatter(lctx, self, src, dim=0, start=None, end=None, step=1):
   )
   out = stablehlo.select(pred, self, src)
   return out
+
+
+# Schema:
+#   - aten::_to_copy(Tensor self, *, ScalarType? dtype=None,
+#       Layout? layout=None, Device? device=None, bool? pin_memory=None,
+#       bool non_blocking=False, MemoryFormat? memory_format=None) -> Tensor
+@lower(torch.ops.aten._to_copy.default)
+def _aten_to_copy(
+    lctx, x: ir.Value, dtype: torch.dtype | None = None, **kwargs
+):
+  if not dtype:
+    return x
+
+  return stablehlo.convert(
+      ir.RankedTensorType.get(
+          x.type.shape, utils.torch_dtype_to_ir_element_type(dtype)
+      ),
+      x,
+  )
+
+
+# Schema:
+#   - aten::sym_size.int(Tensor self, int dim) -> SymInt
+@lower(torch.ops.aten.sym_size.int)
+def _aten_sym_size_int(lctx, x: ir.Value, dim: int):
+  return stablehlo.get_dimension_size(x, dim)
+
+
+# Lowering for the multiplication operator (`*`).
+# Handles cases where one operand is an integer (scalar) and the other is a
+# tensor, broadcasting the scalar to the tensor's shape before multiplication.
+@lower(operator.mul)
+def _operator_mul(lctx, self: int | ir.Value, other: int | ir.Value):
+  if isinstance(self, int) and isinstance(other, ir.Value):
+    self = utils.splat(self, other.type.element_type, other.type.shape)
+  if isinstance(other, int) and isinstance(self, ir.Value):
+    other = utils.splat(other, self.type.element_type, self.type.shape)
+  return stablehlo.multiply(self, other)

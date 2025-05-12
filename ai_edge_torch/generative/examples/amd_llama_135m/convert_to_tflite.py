@@ -15,53 +15,26 @@
 
 """Example of converting AMD-Llama-135m model to multi-signature tflite model."""
 
-import os
-import pathlib
-
 from absl import app
-from absl import flags
 from ai_edge_torch.generative.examples.amd_llama_135m import amd_llama_135m
 from ai_edge_torch.generative.utilities import converter
-from ai_edge_torch.generative.utilities.model_builder import ExportConfig
+from ai_edge_torch.generative.utilities import export_config
 
-_CHECKPOINT_PATH = flags.DEFINE_string(
-    'checkpoint_path',
-    os.path.join(pathlib.Path.home(), 'Downloads/llm_data/amd-llama-135m'),
-    'The path to the model checkpoint, or directory holding the checkpoint.',
-)
-_TFLITE_PATH = flags.DEFINE_string(
-    'tflite_path',
-    '/tmp/',
-    'The tflite file path to export.',
-)
-_PREFILL_SEQ_LEN = flags.DEFINE_integer(
-    'prefill_seq_len',
-    1024,
-    'The maximum size of prefill input tensor.',
-)
-_KV_CACHE_MAX_LEN = flags.DEFINE_integer(
-    'kv_cache_max_len',
-    1280,
-    'The maximum size of KV cache buffer, including both prefill and decode.',
-)
-_QUANTIZE = flags.DEFINE_bool(
-    'quantize',
-    True,
-    'Whether the model should be quantized.',
-)
+flags = converter.define_conversion_flags("amd-llama-135m")
+ExportConfig = export_config.ExportConfig
 
 
 def main(_):
   pytorch_model = amd_llama_135m.build_model(
-      _CHECKPOINT_PATH.value, kv_cache_max_len=_KV_CACHE_MAX_LEN.value
+      flags.FLAGS.checkpoint_path, kv_cache_max_len=flags.FLAGS.kv_cache_max_len
   )
-  quant_suffix = 'q8' if _QUANTIZE.value else 'f32'
-  output_filename = f'amd-llama-135m_{quant_suffix}_seq{_PREFILL_SEQ_LEN.value}_ekv{_KV_CACHE_MAX_LEN.value}.tflite'
   converter.convert_to_tflite(
       pytorch_model,
-      tflite_path=os.path.join(_TFLITE_PATH.value, output_filename),
-      prefill_seq_len=_PREFILL_SEQ_LEN.value,
-      quantize=_QUANTIZE.value,
+      output_path=flags.FLAGS.output_path,
+      output_name_prefix=flags.FLAGS.output_name_prefix,
+      prefill_seq_len=flags.FLAGS.prefill_seq_lens,
+      quantize=flags.FLAGS.quantize,
+      lora_ranks=flags.FLAGS.lora_ranks,
       export_config=ExportConfig(),
   )
 

@@ -19,8 +19,10 @@ import logging
 from typing import Any, List, Optional
 
 from ai_edge_torch.generative.layers import kv_cache as kv_utils
-from ai_edge_torch.generative.utilities.model_builder import ExportConfig
+from ai_edge_torch.generative.utilities import export_config
 import torch
+
+ExportConfig = export_config.ExportConfig
 
 
 class ModelWrapper(torch.nn.Module):
@@ -83,13 +85,34 @@ class ModelWrapper(torch.nn.Module):
 class ReauthoredModelWrapper(ModelWrapper):
   """A wrapper for the model reauthored with ai_edge_torch Generative API."""
 
+  def __init__(
+      self,
+      model: torch.nn.Module,
+      mask_as_input: bool = False,
+      kv_layout: kv_utils.KVLayout = kv_utils.KV_LAYOUT_DEFAULT,
+  ):
+    """Wraps a reauthored model with some options."""
+    super().__init__(model)
+    self.mask_as_input = mask_as_input
+    self.kv_layout = kv_layout
+
   def _init_kv_cache(self):
     """Returns an initialized KV cache."""
-    return kv_utils.KVCache.from_model_config(self.model.config)
+    return kv_utils.KVCache.from_model_config(
+        self.model.config, kv_layout=self.kv_layout
+    )
 
   def _get_extra_args_for_forward(self) -> dict[str, Any]:
     """Returns extra arguments for the forward() method."""
     return {}
+
+  def _build_mask(self, input_pos: torch.Tensor) -> torch.Tensor:
+    """Builds a mask for the model."""
+    kv_cache_max_len = self.model.config.kv_cache_max_len
+    mask = torch.full(
+        (len(input_pos), kv_cache_max_len), float("-inf"), dtype=torch.float32
+    )
+    return torch.triu(mask, diagonal=input_pos[0] + 1).unsqueeze(0).unsqueeze(0)
 
   def _forward_with_kv_cache(
       self,
@@ -117,6 +140,8 @@ class ReauthoredModelWrapper(ModelWrapper):
       extra_args["export_config"] = self.export_config
     if pixel_values is not None:
       extra_args["pixel_values"] = pixel_values
+    if self.mask_as_input:
+      extra_args["mask"] = self._build_mask(input_pos)
     output = self.model.forward(tokens, input_pos, kv_cache, **extra_args)
     return output["logits"], output["kv_cache"]
 
@@ -179,7 +204,7 @@ def verify_with_input_ids(
     original_model: ModelWrapper,
     reauthored_model: ReauthoredModelWrapper,
     input_ids: List[int],
-    kv_cache_max_len: int = 1024,
+    kv_cache_max_len: int = 128,
     rtol: float = 1e-05,
     atol: float = 1e-05,
 ):
@@ -271,6 +296,8 @@ def verify_reauthored_model(
     rtol: float = 1e-05,
     atol: float = 1e-05,
     continue_on_failure: bool = False,
+    verify_inputs: bool = True,
+    verify_prompts: bool = True,
 ) -> bool:
   """Verifies the reauthored model against the original model.
 
@@ -299,33 +326,37 @@ def verify_reauthored_model(
   """
   failure_count = 0
 
-  for input_ids in forward_input_ids:
-    logging.info("Verifying the reauthored model with input IDs: %s", input_ids)
-    try:
-      verify_with_input_ids(
-          original_model, reauthored_model, input_ids, rtol=rtol, atol=atol
+  if verify_inputs:
+    for input_ids in forward_input_ids:
+      logging.info(
+          "Verifying the reauthored model with input IDs: %s", input_ids
       )
-    except AssertionError as e:
-      logging.error("*** FAILED *** verify with input IDs: %s", input_ids)
-      failure_count += 1
-      if not continue_on_failure:
-        return False
-    else:
-      logging.info("*** PASSED *** verify with input IDs: %s", input_ids)
+      try:
+        verify_with_input_ids(
+            original_model, reauthored_model, input_ids, rtol=rtol, atol=atol
+        )
+      except AssertionError as e:
+        logging.error("*** FAILED *** verify with input IDs: %s", input_ids)
+        failure_count += 1
+        if not continue_on_failure:
+          return False
+      else:
+        logging.info("*** PASSED *** verify with input IDs: %s", input_ids)
 
-  for prompts in generate_prompts:
-    logging.info("Verifying the reauthored model with prompts: %s", prompts)
-    try:
-      verify_model_with_prompts(
-          original_model, reauthored_model, tokenizer, prompts, max_new_tokens
-      )
-    except AssertionError as e:
-      logging.error("*** FAILED *** verify with prompts: %s", prompts)
-      failure_count += 1
-      if not continue_on_failure:
-        return False
-    else:
-      logging.info("*** PASSED *** verify with prompts: %s", prompts)
+  if verify_prompts:
+    for prompts in generate_prompts:
+      logging.info("Verifying the reauthored model with prompts: %s", prompts)
+      try:
+        verify_model_with_prompts(
+            original_model, reauthored_model, tokenizer, prompts, max_new_tokens
+        )
+      except AssertionError as e:
+        logging.error("*** FAILED *** verify with prompts: %s", prompts)
+        failure_count += 1
+        if not continue_on_failure:
+          return False
+      else:
+        logging.info("*** PASSED *** verify with prompts: %s", prompts)
 
   if failure_count == 0:
     logging.info("*** PASSED *** verify_reauthored_model")

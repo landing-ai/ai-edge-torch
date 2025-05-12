@@ -32,16 +32,14 @@ class TestModelConversion(googletest.TestCase):
 
   def setUp(self):
     super().setUp()
-    # Builder function for an Interpreter that supports custom ops.
     self._interpreter_builder = (
-        lambda tflite_model: lambda: interpreter.InterpreterWithCustomOps(
-            custom_op_registerers=["GenAIOpsRegisterer"],
+        lambda tflite_model: lambda: interpreter.Interpreter(
             model_content=tflite_model,
             experimental_default_delegate_latest_features=True,
         )
     )
 
-  def _get_params(self, enable_hlfb: bool):
+  def _get_params(self, enable_hlfb: bool, kv_layout: kv_cache.KVLayout):
     """Returns a model, edge model and the kwargs to use for testing."""
     config = toy_model_with_kv_cache.get_model_config()
     config.enable_hlfb = enable_hlfb
@@ -49,7 +47,7 @@ class TestModelConversion(googletest.TestCase):
     tokens, input_pos = torch.tensor([[1]], dtype=torch.int), torch.tensor(
         [10], dtype=torch.int
     )
-    kv = kv_cache.KVCache.from_model_config(config)
+    kv = kv_cache.KVCache.from_model_config(config, kv_layout=kv_layout)
     kwargs = {
         "tokens": tokens,
         "input_pos": input_pos,
@@ -65,8 +63,12 @@ class TestModelConversion(googletest.TestCase):
     )
     return pytorch_model, edge_model, kwargs
 
-  def _test_model_with_kv_cache(self, enable_hlfb: bool):
-    pytorch_model, edge_model, kwargs = self._get_params(enable_hlfb)
+  def _test_model_with_kv_cache(
+      self,
+      enable_hlfb: bool = False,
+      kv_layout: kv_cache.KVLayout = kv_cache.KV_LAYOUT_DEFAULT,
+  ):
+    pytorch_model, edge_model, kwargs = self._get_params(enable_hlfb, kv_layout)
 
     self.assertTrue(
         test_utils.compare_tflite_torch(
@@ -81,38 +83,34 @@ class TestModelConversion(googletest.TestCase):
         )
     )
 
-  @googletest.skipIf(
-      ai_edge_torch.config.in_oss,
-      reason="tests with custom ops are not supported in oss",
-  )
   def test_toy_model_with_kv_cache(self):
     self._test_model_with_kv_cache(enable_hlfb=False)
 
-  @googletest.skipIf(
-      ai_edge_torch.config.in_oss,
-      reason="tests with custom ops are not supported in oss",
-  )
   def test_toy_model_with_kv_cache_with_hlfb(self):
     self._test_model_with_kv_cache(enable_hlfb=True)
 
-  @googletest.skipIf(
-      ai_edge_torch.config.in_oss,
-      reason="tests with custom ops are not supported in oss",
-  )
+  def test_toy_model_with_kv_cache_transposed(self):
+    self._test_model_with_kv_cache(kv_layout=kv_cache.KV_LAYOUT_TRANSPOSED)
+
   def test_toy_model_has_dus_op(self):
     """Tests that the model has the dynamic update slice op."""
-    _, edge_model, _ = self._get_params(enable_hlfb=True)
-    interpreter_ = interpreter.InterpreterWithCustomOps(
-        custom_op_registerers=["GenAIOpsRegisterer"],
-        model_content=edge_model.tflite_model(),
-        experimental_default_delegate_latest_features=True,
+    _, edge_model, _ = self._get_params(
+        enable_hlfb=True, kv_layout=kv_cache.KV_LAYOUT_DEFAULT
     )
+    interpreter = self._interpreter_builder(edge_model.tflite_model())()
 
     # pylint: disable=protected-access
-    op_names = [op["op_name"] for op in interpreter_._get_ops_details()]
+    op_names = [op["op_name"] for op in interpreter._get_ops_details()]
     self.assertIn("DYNAMIC_UPDATE_SLICE", op_names)
 
-  def _test_multisig_model(self, config, pytorch_model, atol, rtol):
+  def _test_multisig_model(
+      self,
+      config,
+      pytorch_model,
+      atol,
+      rtol,
+      kv_layout=kv_cache.KV_LAYOUT_DEFAULT,
+  ):
     # prefill
     seq_len = 10
     prefill_tokens = torch.zeros((1, seq_len), dtype=torch.int, device="cpu")
@@ -124,7 +122,7 @@ class TestModelConversion(googletest.TestCase):
     decode_token = torch.tensor([[1]], dtype=torch.int)
     decode_input_pos = torch.tensor([5], dtype=torch.int)
 
-    kv = kv_cache.KVCache.from_model_config(config)
+    kv = kv_cache.KVCache.from_model_config(config, kv_layout=kv_layout)
 
     edge_model = (
         ai_edge_torch.signature(
@@ -160,7 +158,7 @@ class TestModelConversion(googletest.TestCase):
             kv,
             signature_name="prefill",
             atol=atol,
-            rtol=atol,
+            rtol=rtol,
         )
     )
 
@@ -173,18 +171,25 @@ class TestModelConversion(googletest.TestCase):
             kv,
             signature_name="decode",
             atol=atol,
-            rtol=atol,
+            rtol=rtol,
         )
     )
 
-  @googletest.skipIf(
-      ai_edge_torch.config.in_oss,
-      reason="tests with custom ops are not supported in oss",
-  )
   def test_tiny_llama_multisig(self):
     config = tiny_llama.get_fake_model_config()
     pytorch_model = tiny_llama.TinyLlama(config).eval()
     self._test_multisig_model(config, pytorch_model, atol=1e-5, rtol=1e-5)
+
+  def test_tiny_llama_multisig_kv_layout_transposed(self):
+    config = tiny_llama.get_fake_model_config()
+    pytorch_model = tiny_llama.TinyLlama(config).eval()
+    self._test_multisig_model(
+        config,
+        pytorch_model,
+        atol=1e-5,
+        rtol=1e-5,
+        kv_layout=kv_cache.KV_LAYOUT_TRANSPOSED,
+    )
 
 
 if __name__ == "__main__":
