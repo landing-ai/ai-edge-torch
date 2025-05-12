@@ -20,6 +20,7 @@ import enum
 from typing import Callable, Optional, Sequence, Tuple, Union
 from ai_edge_torch.generative.layers import rotary_position_embedding
 
+
 @enum.unique
 class ActivationType(enum.Enum):
   """Different activation functions supported by the default builder."""
@@ -115,6 +116,8 @@ class AttentionConfig:
   attn_type: Optional[AttentionType] = None
   # The size of the sliding window used for local attention.
   sliding_window_size: Optional[int] = None
+  # The default causal mask value used by attention layer.
+  causal_mask_value: float = float("-inf")
 
 
 @dataclasses.dataclass
@@ -220,15 +223,17 @@ class ModelConfig:
   # The maximum sequence length of the KV cache. Should not exceed max_seq_len.
   kv_cache_max_len: int = 0
 
-  # Default batch size of the exported model. Default value is 1.
-  batch_size: int = 1
-
   # Softcap on the model output logits.
   final_logit_softcap: Optional[float] = None
 
   # The function to call to create the RoPE sin and cos vectors during the
   # forward pass. Defaults to a standard implementation.
   build_rope: Callable = rotary_position_embedding.build_rope
+
+  # Whether or not to use a mask cache. Mask cache can speed up inference when
+  # statically exporting models. However, it is not supported in the dynamic
+  # export.
+  use_mask_cache: bool = True
 
   @property
   def kv_cache_max(self) -> int:
@@ -244,3 +249,7 @@ class ModelConfig:
           f"Index {idx} is out of range for layer configs: {self.block_configs}"
       )
     return self.block_configs[idx]
+
+  @property
+  def causal_mask_value(self) -> float:
+    return self.block_config(0).attn_config.causal_mask_value

@@ -21,6 +21,7 @@ from ai_edge_torch.generative.layers import builder
 from ai_edge_torch.generative.layers import kv_cache as kv_utils
 from ai_edge_torch.generative.layers import lora as lora_utils
 from ai_edge_torch.generative.layers import scaled_dot_product_attention as sdpa
+from ai_edge_torch.generative.layers import sdpa_with_kv_update
 import ai_edge_torch.generative.layers.model_config as cfg
 import ai_edge_torch.generative.layers.rotary_position_embedding as rotary_pos_emb
 import torch
@@ -48,7 +49,6 @@ class TransformerBlock(nn.Module):
         config.pre_attention_norm_config,
     )
     self.atten_func = CausalSelfAttention(
-        model_config.batch_size,
         model_config.embedding_dim,
         config.attn_config,
         model_config.enable_hlfb,
@@ -115,7 +115,6 @@ class CausalSelfAttention(nn.Module):
 
   def __init__(
       self,
-      batch_size: int,
       dim: int,
       config: cfg.AttentionConfig,
       enable_hlfb: bool,
@@ -123,14 +122,12 @@ class CausalSelfAttention(nn.Module):
     """Initialize an instance of CausalSelfAttention.
 
     Args:
-      batch_size (int): batch size of the input tensor.
       dim (int): causal attention's input/output dimmension.
       config (cfg.AttentionConfig): attention specific configurations.
       enable_hlfb (bool): whether hlfb is enabled or not.
     """
     super().__init__()
     self.kv_cache = None
-    self.batch_size = batch_size
     qkv_shape = (
         config.num_heads + 2 * config.num_query_groups
     ) * config.head_dim
@@ -146,11 +143,6 @@ class CausalSelfAttention(nn.Module):
     self.key_norm = builder.build_norm(config.head_dim, config.key_norm_config)
     self.config = config
     self.enable_hlfb = enable_hlfb
-    self.sdpa_func = (
-        sdpa.scaled_dot_product_attention_with_hlfb
-        if enable_hlfb
-        else sdpa.scaled_dot_product_attention
-    )
 
   def forward(
       self,
@@ -178,12 +170,7 @@ class CausalSelfAttention(nn.Module):
         KV Cach Entry (if passed in).
     """
     # Batch size, sequence length, embedding dimensionality.
-    B, T, E = x.size()
-    assert B == self.batch_size, (
-        "batch size of input tensor must match with the batch size specified in"
-        " the model configuration."
-    )
-
+    B, T, _ = x.size()
     qkv = self.qkv_projection(x)
 
     # Assemble into a number of query groups to support MHA, MQA and GQA.
@@ -227,19 +214,9 @@ class CausalSelfAttention(nn.Module):
       cos, sin = rope
       q, k = rotary_pos_emb.apply_rope_inline(q, k, cos, sin)
 
-    if kv_cache is not None:
-      kv_cache = kv_utils.update(kv_cache, input_pos, k, v)
-      k, v = kv_cache.k_cache, kv_cache.v_cache
-
-    sdpa_out = self.sdpa_func(
-        q,
-        k,
-        v,
-        self.config.head_dim,
-        mask=mask,
-        softcap=self.config.logit_softcap,
+    sdpa_out, kv_cache = sdpa_with_kv_update.sdpa_with_kv_update(
+        q, k, v, kv_cache, input_pos, mask, self.config, self.enable_hlfb
     )
-    sdpa_out = sdpa_out.reshape(B, T, -1)
 
     # Compute the output projection.
     y = self.output_projection(sdpa_out)
@@ -290,7 +267,6 @@ class CrossAttention(nn.Module):
 
   def __init__(
       self,
-      batch_size: int,
       query_dim: int,
       cross_dim: int,
       hidden_dim: int,
@@ -301,7 +277,6 @@ class CrossAttention(nn.Module):
     """Initialize an instance of CrossAttention.
 
     Args:
-      batch_size (int): batch size of the input tensor.
       query_dim (int): query tensor's dimension.
       cross_dim (int): cross attention's dimensions, for key and value tensors.
       hidden_dim (int): hidden dimension that q, k, v tensors project to.
@@ -376,7 +351,6 @@ class CrossAttention(nn.Module):
 
     if rope is not None:
       # Compute rotary positional embedding for query and key.
-      n_elem = int(self.config.rotary_percentage * self.config.head_dim)
       cos, sin = rope
       q, k = rotary_pos_emb.apply_rope_inline(q, k, cos, sin)
 

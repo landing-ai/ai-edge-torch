@@ -81,9 +81,13 @@ setup(
     ),
     python_requires=">=3.10",
     install_requires=[
+        "absl-py",
         "numpy",
         "scipy",
         "safetensors",
+        "multipledispatch",
+        "transformers",
+        "kagglehub",
         "tabulate",
         "torch>=2.4.0",
         "tf-nightly>=2.19.0.dev20250101",

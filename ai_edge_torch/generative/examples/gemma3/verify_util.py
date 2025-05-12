@@ -1,4 +1,4 @@
-# Copyright 2024 The AI Edge Torch Authors.
+# Copyright 2025 The AI Edge Torch Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,14 +17,22 @@
 
 import logging
 import os
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
-from ai_edge_torch.generative.examples.experimental.gemma import gemma2_gpu
+from ai_edge_torch.generative.examples.gemma3 import gemma3
+from ai_edge_torch.generative.layers import kv_cache as kv_utils
 import ai_edge_torch.generative.layers.attention_utils as attn_utils
-from ai_edge_torch.generative.utilities.experimental import verifier
+from ai_edge_torch.generative.utilities import verifier
 from gemma import config as gemma_config
 from gemma import model as gemma_model
 import torch
+
+
+def _get_actual_input_len(tokens: torch.Tensor) -> int:
+  for i in range(tokens.shape[1]):
+    if tokens[0, i] == 0:
+      return i
+  return tokens.shape[1]
 
 
 class GemmaWrapper(verifier.ModelWrapper):
@@ -38,12 +46,6 @@ class GemmaWrapper(verifier.ModelWrapper):
   inside model.generate().
   """
 
-  def _get_actual_input_len(self, tokens: torch.Tensor) -> int:
-    for i in range(tokens.shape[1]):
-      if tokens[0, i] == 0:
-        return i
-    return tokens.shape[1]
-
   def _get_kv_caches(
       self, max_seq_len: int
   ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
@@ -56,9 +58,12 @@ class GemmaWrapper(verifier.ModelWrapper):
 
   def forward(self, tokens: torch.Tensor) -> torch.Tensor:
     """Forwards the model after reducing input tokens to the actual length."""
-    actual_input_len = self._get_actual_input_len(tokens)
+    actual_input_len = _get_actual_input_len(tokens)
     input_pos = torch.arange(0, actual_input_len, dtype=torch.long)
     mask_cache = attn_utils.build_causal_mask_cache(tokens.shape[1])
+    local_mask_cache = attn_utils.build_sliding_window_mask_cache(
+        tokens.shape[1], self.model.config.sliding_window_size
+    )
     _, logits = self.model.forward(
         input_token_ids=tokens[0, :actual_input_len].unsqueeze(0),
         input_positions=input_pos,
@@ -69,6 +74,7 @@ class GemmaWrapper(verifier.ModelWrapper):
         temperatures=None,
         top_ps=torch.tensor([1.0], dtype=torch.float),
         top_ks=torch.tensor([1], dtype=torch.long),
+        local_mask=local_mask_cache.index_select(2, input_pos),
     )
     return logits
 
@@ -81,6 +87,61 @@ class GemmaWrapper(verifier.ModelWrapper):
         prompts, device="cpu", output_len=max_new_tokens, top_k=1
     )
     return torch.tensor([self.model.tokenizer.encode(prompts + response)])
+
+
+class UnifiedGemma3Wrapper(verifier.ReauthoredModelWrapper):
+  """Unified Gemma3 model wrapper for verification."""
+
+  def __init__(self, model: torch.nn.Module):
+    super().__init__(model, kv_layout=kv_utils.KV_LAYOUT_TRANSPOSED)
+
+  def _init_kv_cache(self):
+    return kv_utils.KVCache.from_model_config(
+        self.model.model.config, kv_layout=self.kv_layout
+    )
+
+  def forward(
+      self, tokens: torch.Tensor, pixel_values: torch.Tensor = None
+  ) -> torch.Tensor:
+    """Forwards the model."""
+    mask = attn_utils.build_causal_mask_cache(
+        self.model.model.config.kv_cache_max_len
+    )
+    input_pos = torch.arange(0, tokens.shape[1], dtype=torch.int)
+    mask = mask.index_select(2, input_pos)
+    output = self.model.model.forward(
+        tokens, input_pos, self._init_kv_cache(), mask=mask
+    )
+    return output["logits"]
+
+  def generate(
+      self,
+      prompts: torch.Tensor,
+      max_new_tokens: int,
+      pixel_values: torch.Tensor = None,
+      eos_token_id: Optional[int] = None,
+  ) -> torch.IntTensor:
+    """Generates the response."""
+    input_ids = prompts[0].int().tolist()
+    tokens = torch.tensor([input_ids])
+    input_pos = torch.arange(0, tokens.shape[1], dtype=torch.int)
+    kv_cache = self._init_kv_cache()
+    mask_cache = attn_utils.build_causal_mask_cache(
+        self.model.model.config.kv_cache_max_len
+    )
+    for _ in range(max_new_tokens):
+      mask = mask_cache.index_select(2, input_pos)
+      output = self.model.model.forward(
+          tokens, input_pos, kv_cache, mask=mask
+      )
+      logits, kv_cache = output["logits"], output["kv_cache"]
+      generated_token = logits[0][-1].argmax().item()
+      input_ids.append(generated_token)
+      if eos_token_id is not None and generated_token == eos_token_id:
+        break
+      tokens = torch.tensor([[generated_token]])
+      input_pos = torch.tensor([len(input_ids) - 1])
+    return torch.tensor([input_ids])
 
 
 class GemmaTokenizerWrapper(verifier.TokenizerWrapper):
@@ -105,7 +166,7 @@ def verify_reauthored_gemma_model(
     reauthored_model: torch.nn.Module,
     generate_prompts: List[str],
     forward_input_ids: List[List[int]],
-    weight_filename: str = "model.ckpt",
+    weight_filename: str,
     tokenizer_filename: str = "tokenizer.model",
     max_new_tokens: int = 20,
     rtol: float = 1e-05,
@@ -113,7 +174,20 @@ def verify_reauthored_gemma_model(
 ) -> bool:
   """Verifies the reauthored Gemma model against the original model.
 
-  Returns True if the verification passes, False otherwise.
+  Args:
+      checkpoint: Path to the Gemma checkpoint.
+      variant: Gemma model variant.
+      reauthored_model: The reauthored model to verify.
+      generate_prompts: List of prompts for generation.
+      forward_input_ids: List of input ids for forward pass.
+      weight_filename: Name of the weight file.
+      tokenizer_filename: Name of the tokenizer file.
+      max_new_tokens: Maximum number of new tokens to generate.
+      rtol: Relative tolerance for comparison.
+      atol: Absolute tolerance for comparison.
+
+  Returns:
+      True if the verification passes, False otherwise.
   """
   config = gemma_config.get_model_config(variant)
   config.tokenizer = os.path.join(checkpoint, tokenizer_filename)
@@ -126,7 +200,7 @@ def verify_reauthored_gemma_model(
 
   return verifier.verify_reauthored_model(
       original_model=GemmaWrapper(original_model),
-      reauthored_model=verifier.ReauthoredModelWrapper(reauthored_model),
+      reauthored_model=UnifiedGemma3Wrapper(reauthored_model),
       tokenizer=GemmaTokenizerWrapper(original_model.tokenizer),
       generate_prompts=generate_prompts,
       max_new_tokens=max_new_tokens,
@@ -136,22 +210,42 @@ def verify_reauthored_gemma_model(
   )
 
 
-def verify_gemma2_gpu(
-    gemma2_model_path: str, prompts: List[str], max_new_tokens: int
+def verify_gemma3(
+    checkpoint: str,
+    prompts: List[str],
+    max_new_tokens: int,
+    variant: str,
+    weight_filename: str,
 ) -> bool:
-  """Verifies the reauthored Gemma2 model.
+  """Verifies the reauthored Gemma3 model.
 
-  Return True if the verification passes, False otherwise.
+  Args:
+      checkpoint: Path to the Gemma checkpoint.
+      prompts: List of prompts for generation.
+      max_new_tokens: Maximum number of new tokens to generate.
+      variant: Gemma model variant.
+      weight_filename: Name of the weight file.
+
+  Returns:
+      True if the verification passes, False otherwise.
   """
-  logging.info("Building the reauthored model from: %s", gemma2_model_path)
-  reauthored_model = gemma2_gpu.build_2b_model(gemma2_model_path)
+  gemma3_model_path = os.path.join(checkpoint, weight_filename)
+  logging.info("Building the reauthored model from: %s", gemma3_model_path)
+
+  if variant == "1b":
+    reauthored_model = UnifiedGemma3Wrapper(
+        gemma3.build_model_1b(gemma3_model_path)
+    )
+  else:
+    raise ValueError(f"Unsupported Gemma3 variant: {variant}")
 
   return verify_reauthored_gemma_model(
-      checkpoint=gemma2_model_path,
-      variant="2b-v2",
+      checkpoint=checkpoint,
+      variant=variant,
       reauthored_model=reauthored_model,
       generate_prompts=prompts,
       forward_input_ids=[[2, 651, 9456, 576, 573, 3520, 3858, 603, 235248]],
       max_new_tokens=max_new_tokens,
+      weight_filename=weight_filename,
       atol=1e-04,
   )

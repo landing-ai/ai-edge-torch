@@ -35,14 +35,11 @@ def _run_convert_passes(
   )
 
   passes = [
-      fx_passes.BuildInterpolateCompositePass(),
-      fx_passes.CanonicalizePass(),
       fx_passes.OptimizeLayoutTransposesPass(),
       fx_passes.CanonicalizePass(),
       fx_passes.BuildAtenCompositePass(),
-      fx_passes.CanonicalizePass(),
       fx_passes.RemoveNonUserOutputsPass(),
-      fx_passes.CanonicalizePass(),
+      fx_passes.CastInputsBf16ToF32Pass(),
   ]
 
   # Debuginfo is not injected automatically by odml_torch. Only inject
@@ -124,6 +121,10 @@ def convert_signatures(
       exported_program = torch.export.export(**kwargs, strict=False)
     else:
       exported_program = torch.export.export(**kwargs, strict=True)
+
+    exported_program = fx_infra.graph_utils.reset_from_node_meta(
+        exported_program
+    )
 
     exported_program = fx_infra.safe_run_decompositions(
         exported_program,

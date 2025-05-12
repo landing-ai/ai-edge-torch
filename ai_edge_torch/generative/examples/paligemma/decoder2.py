@@ -20,6 +20,7 @@ from typing import Optional
 from ai_edge_torch.generative.examples.gemma import gemma2
 from ai_edge_torch.generative.layers import kv_cache as kv_utils
 import ai_edge_torch.generative.layers.model_config as cfg
+from ai_edge_torch.generative.utilities import export_config as export_cfg
 from ai_edge_torch.generative.utilities import model_builder
 import ai_edge_torch.generative.utilities.loader as loading_utils
 import torch
@@ -57,7 +58,7 @@ class Decoder2(gemma2.Gemma2):
       kv_cache: kv_utils.KVCache,
       input_embeds: torch.Tensor = None,
       mask: Optional[torch.Tensor] = None,
-      export_config: Optional[model_builder.ExportConfig] = None,
+      export_config: Optional[export_cfg.ExportConfig] = None,
   ) -> dict[torch.Tensor, kv_utils.KVCache]:
     if input_embeds is None:
       return super().forward(tokens, input_pos, kv_cache, mask, export_config)
@@ -74,7 +75,7 @@ class Decoder2(gemma2.Gemma2):
       # By default, don't mask image embeds with a diagonal causal mask.
       embeds_len = input_embeds.shape[1]
       mask = torch.zeros(embeds_len, self.config.kv_cache_max)
-      mask[:, embeds_len:] = float("-inf")
+      mask[:, embeds_len:] = attn_config.causal_mask_value
 
     return self._forward_with_embeds(
         input_embeds, rope, mask, input_pos, kv_cache, export_config
